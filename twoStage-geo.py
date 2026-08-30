@@ -1,60 +1,4 @@
-"""
-train_classifier_eval_yolov8_edl_pue.py — 两阶段开集目标检测（单文件版，CLIP + OWEL + EDL）
 
-整体设计
---------
-阶段 1：冻结的单类 class-agnostic RT-DETR(官方 rtdetr_pytorch) 检测器，只检测一类 "object"，生成候选框。
-阶段 2：对候选框 crop，用 CLIP image encoder 提取特征：
-  - 分类头 = 冻结的类别文本嵌入 + 共享文本适配器（见下"文本适配器版"）；
-  - 损失   = EDL（Evidential Deep Learning）证据损失 + 弱 KL 正则（线性退火）
-             + 可选 ETF-style 几何稳定正则（吸收 ENC/Neural Collapse 思想，不替换 EDL 监督）；
-  - 开集   = EDL 不确定度（拒识 NOOD）+ Pseudo Unknown Embedding（发现 FOOD）。
-
-★本版新增：开集评估指标 WI / AOSE / U-Recall（遵循 opendet2/OWOD 定义，IoU=0.5）
-----------------------------------------------------------------------
-  - AOSE  : 跨所有已知类，"未知物体被判为某已知类"的检测框绝对数量（整数）。
-  - WI@0.8: 已知类召回=0.8 的操作点上，mean_k(FP_open)/mean_k(TP+FP)，再×100。
-            等价于 (P_K / P_{K∪U} − 1)。FP_open = 判为已知却压在未知GT上的框。
-  - U-Recall: 被检出的未知 GT 占比；不受"未知未穷尽标注"导致的FP影响，比 APU 可靠。
-  评估时务必用低 --conf（如 0.05），否则召回到不了 0.8、WI 操作点不可比。
-
-★文本适配器版改动（相对上一版，配合"视觉 backbone 必须解冻"的现实）
-----------------------------------------------------------------------
-背景：X光域差距主要在视觉侧，backbone 不解冻就检不出已知类（已由实验确认）。
-      但 backbone 解冻后图像特征 f 漂出 CLIP 原始空间，而上一版把 w0 作为 buffer
-      钉死在旧文本空间，导致 PUE（wU = w0 − α·w̄）几何不自洽、pue_hit 全触发/全不触发。
-
-本版做法（让文本侧也能迁移到适配空间，且保持 w_k 与 w0 几何一致）：
-  - 文本编码器仍"用完即弃"：只在初始化时编码类名/通用词，得到原始嵌入后整体 del。
-  - 原始类嵌入 text_wk、通用词嵌入 w0 都冻结为 buffer（不再是可训练 class_embeds）。
-  - 新增共享 TextAdapter（CLIP-Adapter 式残差瓶颈）：
-        w_k  = Adapter(text_wk)        # 已知类锚点
-        w0'  = Adapter(w0)             # 通用/未知方向
-        w̄   = normalize(mean_k w_k)
-        wU   = normalize( w0' − α·w̄ )  # 两端都过同一适配器 → 同一空间 → PUE 自洽
-  - 训练参数 = TextAdapter + logit_scale + （解冻的）visual。文本塔不参与训练。
-
-CLIP backbone 冻结开关
-----------------------
-  --unfreeze-backbone     解冻 CLIP image encoder 一起微调（X光建议解冻）。
-  --backbone-lr           解冻时 backbone 的学习率（建议 1e-5~1e-6）。
-  --freeze-epochs N       解冻模式下，前 N 个 epoch 仍冻结 backbone（先让适配器/温度收敛）。
-
-几何稳定正则（ENC/Neural Collapse 思想的轻量接入）
----------------------------------------------------
-  --geom-weight           约束 Adapter 后的类原型近似 Simplex ETF 均匀分布，默认 0.01。
-  --geom-include-pue      把 PUE 伪未知方向也纳入原型集合，形成 K+1 个开集锚点，默认开。
-  --geom-feature-weight   可选特征紧致项，把 crop 特征轻量拉向对应类锚点，默认 0（关闭）。
-
-QuickGELU 一致性（★3，沿用上一版）
-----------------------------------
-  open_clip 用 pretrained="openai" 建模时激活是 QuickGELU；pretrained=None 重建得到普通
-  GELU——激活不在 state_dict 里，加载会静默成功但特征全错。ckpt 保存 clip_pretrained 与
-  visual 前向指纹，加载时自检并在不匹配时翻转 quick_gelu 重试。
-
-依赖: torch, torchvision, pillow, numpy, open_clip_torch + lyuwenyu 官方 rtdetr_pytorch(src/)。
-  pip install open_clip_torch
-"""
 
 from __future__ import annotations
 
@@ -1562,25 +1506,8 @@ def main():
 if __name__ == "__main__":
     main()
 
-'''
-# 可选：激活你自己的 Python 环境
-# conda activate your-env
-
-# 从仓库根目录运行。可按本机目录覆盖这些环境变量；默认均使用仓库内的相对目录。
-export RTDETR_ROOT="${RTDETR_ROOT:-$(pwd)}"
-export OXPID_DATA_ROOT="${OXPID_DATA_ROOT:-${RTDETR_ROOT}/dataSet/OXPID_M}"
-export RTDETR_OUTPUT_ROOT="${RTDETR_OUTPUT_ROOT:-${RTDETR_ROOT}/output}"
-export TWO_STAGE_OUTPUT_ROOT="${TWO_STAGE_OUTPUT_ROOT:-${RTDETR_ROOT}/outputTwoStage}"
-export DETECTOR_CKPT="${DETECTOR_CKPT:-${RTDETR_OUTPUT_ROOT}/rtdetr_r50vd_6x_pidray/checkpoint.pth}"
-export CLASSIFIER_CKPT="${CLASSIFIER_CKPT:-${TWO_STAGE_OUTPUT_ROOT}/box_classifier_clip_edl_rtdetr.pt}"
-
-# ★ 阶段1改用 lyuwenyu 官方 RT-DETR(rtdetr_pytorch)。需要额外提供：
-#   --rtdetr-config  官方 YAML config（把 num_classes 改成 1，单类 "object"）
-#   --rtdetr-root    官方 rtdetr_pytorch 根目录(含 src/)，或设环境变量 RTDETR_ROOT
-#   --yw-ckpt        官方 det_solver 保存的 .pth（含 model/ema，优先用 ema）
-
 # ---------- 训练（默认：冻结 CLIP backbone，只训 文本适配器+温度） ----------
-python twoStage-geo.py train \
+python twoStage.py train \
   --json "${OXPID_DATA_ROOT}/train.json" \
   --img-root "${OXPID_DATA_ROOT}/train" \
   --yw-ckpt "${DETECTOR_CKPT}" \
@@ -1593,7 +1520,7 @@ python twoStage-geo.py train \
   --prop-conf 0.05 --prop-iou 0.7 --prop-max-det 300 --pos-iou 0.5 --expand 0.1
 
 # ---------- 训练（解冻 CLIP backbone 微调：X光域差距大，推荐这条） ----------
-python twoStage-geo.py train \
+python twoStage.py train \
   --json "${OXPID_DATA_ROOT}/train.json" \
   --img-root "${OXPID_DATA_ROOT}/train" \
   --yw-ckpt "${DETECTOR_CKPT}" \
@@ -1606,7 +1533,7 @@ python twoStage-geo.py train \
   --geom-weight 0.01 --geom-anneal 0.5 --geom-feature-weight 0.0
 
 # ---------- 单图预测 ----------
-python twoStage-geo.py predict \
+python twoStage.py predict \
   --yw-ckpt "${DETECTOR_CKPT}" \
   --rtdetr-config "${RTDETR_ROOT}/configs/rtdetr/rtdetr_r50vd_6x_pidray.yml" \
   --rtdetr-root "${RTDETR_ROOT}" \
