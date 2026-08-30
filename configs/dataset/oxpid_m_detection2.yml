@@ -1,0 +1,34 @@
+task: detection
+
+num_classes: 12
+remap_mscoco_category: False
+
+train_dataloader: 
+  type: DataLoader
+  dataset: 
+    type: CocoDetection
+    img_folder: ./dataSet/dvxpid/images/train_A/
+    ann_file: ./dataSet/dvxpid/train_A.json
+    transforms:
+      type: Compose
+      ops: ~
+  shuffle: True
+  batch_size: 8
+  num_workers: 4
+  drop_last: True 
+
+
+val_dataloader:
+  type: DataLoader
+  dataset: 
+    type: CocoDetection
+    img_folder: ./dataSet/dvxpid/images/test_A/
+    ann_file: ./dataSet/dvxpid/test_A.json
+    transforms:
+      type: Compose
+      ops: ~ 
+
+  shuffle: False
+  batch_size: 8
+  num_workers: 4
+  drop_last: False

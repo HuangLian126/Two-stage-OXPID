@@ -1,0 +1,40 @@
+# Python caches and build artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+
+# Virtual environments and local secrets
+.venv/
+venv/
+env/
+.env
+.env.*
+!.env.example
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Datasets, training outputs, checkpoints, and exported models
+/data/
+/dataset/
+/datasets/
+/dataSet/
+/output/
+/outputs/
+/outputTwoStage/
+/out/
+/runs/
+/weights/
+/checkpoints/
+*.pt
+*.pth
+*.ckpt
+*.onnx
