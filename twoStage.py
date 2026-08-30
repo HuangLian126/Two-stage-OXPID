@@ -1580,7 +1580,7 @@ export CLASSIFIER_CKPT="${CLASSIFIER_CKPT:-${TWO_STAGE_OUTPUT_ROOT}/box_classifi
 #   --yw-ckpt        官方 det_solver 保存的 .pth（含 model/ema，优先用 ema）
 
 # ---------- 训练（默认：冻结 CLIP backbone，只训 文本适配器+温度） ----------
-python twoStage-geo.py train \
+python twoStage.py train \
   --json "${OXPID_DATA_ROOT}/train.json" \
   --img-root "${OXPID_DATA_ROOT}/train" \
   --yw-ckpt "${DETECTOR_CKPT}" \
@@ -1593,7 +1593,7 @@ python twoStage-geo.py train \
   --prop-conf 0.05 --prop-iou 0.7 --prop-max-det 300 --pos-iou 0.5 --expand 0.1
 
 # ---------- 训练（解冻 CLIP backbone 微调：X光域差距大，推荐这条） ----------
-python twoStage-geo.py train \
+python twoStage.py train \
   --json "${OXPID_DATA_ROOT}/train.json" \
   --img-root "${OXPID_DATA_ROOT}/train" \
   --yw-ckpt "${DETECTOR_CKPT}" \
@@ -1606,7 +1606,7 @@ python twoStage-geo.py train \
   --geom-weight 0.01 --geom-anneal 0.5 --geom-feature-weight 0.0
 
 # ---------- 单图预测 ----------
-python twoStage-geo.py predict \
+python twoStage.py predict \
   --yw-ckpt "${DETECTOR_CKPT}" \
   --rtdetr-config "${RTDETR_ROOT}/configs/rtdetr/rtdetr_r50vd_6x_pidray.yml" \
   --rtdetr-root "${RTDETR_ROOT}" \
@@ -1620,7 +1620,7 @@ python twoStage-geo.py predict \
 
 # ---------- 批量评估（mAPK + APU + WI + AOSE + U-Recall） ----------
 # 注意：WI/AOSE 对 conf 敏感，固定用低 conf(0.05)；WI 默认在已知召回 0.8 处报告。
-python twoStage-geo.py eval \
+python twoStage.py eval \
   --yw-ckpt "${DETECTOR_CKPT}" \
   --rtdetr-config "${RTDETR_ROOT}/configs/rtdetr/rtdetr_r50vd_6x_pidray.yml" \
   --rtdetr-root "${RTDETR_ROOT}" \
