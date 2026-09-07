@@ -1532,8 +1532,6 @@ python twoStage.py predict \
   --conf 0.25 --iou 0.5 --osr-method edl_pue \
   --save-txt --txt-out /home/hl/Student/CQD/rtdetr_pytorch/out/pred_01273.txt
   
-  
-
 # ---------- 批量评估（mAPK + APU + WI + AOSE + U-Recall） ----------
 # 注意：WI/AOSE 对 conf 敏感，固定用低 conf(0.05)；WI 默认在已知召回 0.8 处报告。
 python twoStage.py eval \
