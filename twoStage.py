@@ -1506,7 +1506,6 @@ if __name__ == "__main__":
     main()
 
 '''
-conda activate myenv2
 
 # ---------- 训练（解冻 CLIP backbone 微调：X光域差距大，推荐这条） ----------
 python twoStage.py train \
