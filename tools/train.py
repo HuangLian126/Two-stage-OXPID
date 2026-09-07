@@ -21,11 +21,16 @@ def main(args, ) -> None:
     assert not all([args.tuning, args.resume]), \
         'Only support from_scrach or resume or tuning at one time'
 
+    config_overrides = {}
+    if args.output_dir is not None:
+        config_overrides['output_dir'] = args.output_dir
+
     cfg = YAMLConfig(
         args.config,
         resume=args.resume, 
         use_amp=args.amp,
-        tuning=args.tuning
+        tuning=args.tuning,
+        **config_overrides
     )
 
     solver = TASKS[cfg.yaml_cfg['task']](cfg)
@@ -42,6 +47,8 @@ if __name__ == '__main__':
     parser.add_argument('--config', '-c', type=str, )
     parser.add_argument('--resume', '-r', type=str, )
     parser.add_argument('--tuning', '-t', type=str, )
+    parser.add_argument('--output-dir', '-o', type=str, default=None,
+                        help='checkpoint and log directory; overrides output_dir in the YAML config')
     parser.add_argument('--test-only', action='store_true', default=False,)
     parser.add_argument('--amp', action='store_true', default=False,)
     parser.add_argument('--seed', type=int, help='seed',)

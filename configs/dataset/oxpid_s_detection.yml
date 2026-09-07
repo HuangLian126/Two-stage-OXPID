@@ -7,8 +7,8 @@ train_dataloader:
   type: DataLoader
   dataset: 
     type: CocoDetection
-    img_folder: /home/abc/HL/two OXPID/data/OXPID_S/images/train
-    ann_file: /home/abc/HL/two OXPID/data/OXPID_M/train_one_object.json
+    img_folder: /home/abc/HL/two_OXPID/data/OXPID_S/images/train
+    ann_file: /home/abc/HL/two_OXPID/data/OXPID_S/train_one_object.json
     transforms:
       type: Compose
       ops: ~
@@ -22,8 +22,8 @@ val_dataloader:
   type: DataLoader
   dataset: 
     type: CocoDetection
-    img_folder: /home/abc/HL/two OXPID/data/OXPID_S/images/val
-    ann_file: /home/abc/HL/two OXPID/data/OXPID_M/test_one_object.json
+    img_folder: /home/abc/HL/two_OXPID/data/OXPID_S/images/val
+    ann_file: /home/abc/HL/two_OXPID/data/OXPID_S/test_one_object.json
     transforms:
       type: Compose
       ops: ~ 

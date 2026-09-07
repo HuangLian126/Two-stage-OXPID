@@ -1,3 +1,53 @@
+"""
+train_classifier_eval_yolov8_edl_pue.py — 两阶段开集目标检测（单文件版，CLIP + OWEL + EDL）
+
+整体设计
+--------
+阶段 1：冻结的单类 class-agnostic RT-DETR(官方 rtdetr_pytorch) 检测器，只检测一类 "object"，生成候选框。
+阶段 2：对候选框 crop，用 CLIP image encoder 提取特征：
+  - 分类头 = 冻结的类别文本嵌入 + 共享文本适配器（见下"文本适配器版"）；
+  - 损失   = EDL（Evidential Deep Learning）证据损失 + 弱 KL 正则（线性退火）；
+  - 开集   = EDL 不确定度（拒识 NOOD）+ Pseudo Unknown Embedding（发现 FOOD）。
+
+★本版新增：开集评估指标 WI / AOSE / U-Recall（遵循 opendet2/OWOD 定义，IoU=0.5）
+----------------------------------------------------------------------
+  - AOSE  : 跨所有已知类，"未知物体被判为某已知类"的检测框绝对数量（整数）。
+  - WI@0.8: 已知类召回=0.8 的操作点上，mean_k(FP_open)/mean_k(TP+FP)，再×100。
+            等价于 (P_K / P_{K∪U} − 1)。FP_open = 判为已知却压在未知GT上的框。
+  - U-Recall: 被检出的未知 GT 占比；不受"未知未穷尽标注"导致的FP影响，比 APU 可靠。
+  评估时务必用低 --conf（如 0.05），否则召回到不了 0.8、WI 操作点不可比。
+
+★文本适配器版改动（相对上一版，配合"视觉 backbone 必须解冻"的现实）
+----------------------------------------------------------------------
+背景：X光域差距主要在视觉侧，backbone 不解冻就检不出已知类（已由实验确认）。
+      但 backbone 解冻后图像特征 f 漂出 CLIP 原始空间，而上一版把 w0 作为 buffer
+      钉死在旧文本空间，导致 PUE（wU = w0 − α·w̄）几何不自洽、pue_hit 全触发/全不触发。
+
+本版做法（让文本侧也能迁移到适配空间，且保持 w_k 与 w0 几何一致）：
+  - 文本编码器仍"用完即弃"：只在初始化时编码类名/通用词，得到原始嵌入后整体 del。
+  - 原始类嵌入 text_wk、通用词嵌入 w0 都冻结为 buffer（不再是可训练 class_embeds）。
+  - 新增共享 TextAdapter（CLIP-Adapter 式残差瓶颈）：
+        w_k  = Adapter(text_wk)        # 已知类锚点
+        w0'  = Adapter(w0)             # 通用/未知方向
+        w̄   = normalize(mean_k w_k)
+        wU   = normalize( w0' − α·w̄ )  # 两端都过同一适配器 → 同一空间 → PUE 自洽
+  - 训练参数 = TextAdapter + logit_scale + （解冻的）visual。文本塔不参与训练。
+
+CLIP backbone 冻结开关
+----------------------
+  --unfreeze-backbone     解冻 CLIP image encoder 一起微调（X光建议解冻）。
+  --backbone-lr           解冻时 backbone 的学习率（建议 1e-5~1e-6）。
+  --freeze-epochs N       解冻模式下，前 N 个 epoch 仍冻结 backbone（先让适配器/温度收敛）。
+
+QuickGELU 一致性（★3，沿用上一版）
+----------------------------------
+  open_clip 用 pretrained="openai" 建模时激活是 QuickGELU；pretrained=None 重建得到普通
+  GELU——激活不在 state_dict 里，加载会静默成功但特征全错。ckpt 保存 clip_pretrained 与
+  visual 前向指纹，加载时自检并在不匹配时翻转 quick_gelu 重试。
+
+依赖: torch, torchvision, pillow, numpy, open_clip_torch + lyuwenyu 官方 rtdetr_pytorch(src/)。
+  pip install open_clip_torch
+"""
 
 from __future__ import annotations
 
@@ -481,15 +531,11 @@ class CLIPEDLClassifier(nn.Module):
         return self.forward_feats(x)[0]
 
     # ---- Pseudo Unknown Embedding（论文 Eq.1/2，测试时构造；本版在适配空间内） ----
-    def pseudo_unknown_embedding(self, pue_alpha: float, detach: bool = True) -> torch.Tensor:
+    def pseudo_unknown_embedding(self, pue_alpha: float) -> torch.Tensor:
         # w_k 与 w0 都过同一个 text_adapter -> 同一适配空间，PUE 几何自洽
-        wk = self.adapted_class_embeds()                         # [N, D] 已归一化
-        if detach:
-            wk = wk.detach()
+        wk = self.adapted_class_embeds().detach()                # [N, D] 已归一化
         w_bar = F.normalize(wk.mean(dim=0), dim=-1)              # 归一化均值方向
-        w0_adapted = self.text_adapter(self.w0)                  # [D] 适配后的通用方向（已归一化）
-        if detach:
-            w0_adapted = w0_adapted.detach()
+        w0_adapted = self.text_adapter(self.w0).detach()         # [D] 适配后的通用方向（已归一化）
         wu = w0_adapted - pue_alpha * w_bar
         return F.normalize(wu, dim=-1)                           # [D]
 
@@ -547,74 +593,26 @@ def msp_score(logits: torch.Tensor):
 def energy_score(logits: torch.Tensor):
     return torch.logsumexp(logits, dim=1)
 
-def prototype_etf_loss(model: CLIPEDLClassifier, include_pue: bool = True,
-                       pue_alpha: float = 1.0) -> torch.Tensor:
-    """ETF-style 原型几何正则：让类锚点尽量均匀分布在单位球面上。
-
-    不改变 EDL 的监督形式，只约束 Adapter 后的文本原型几何。若 include_pue=True，
-    则把推理使用的 PUE 伪未知方向也纳入原型集合，相当于形成 K+1 个开放世界锚点。
-    """
-    wk = model.adapted_class_embeds()                            # [K, D]
-    protos = [wk]
-    if include_pue:
-        wu = model.pseudo_unknown_embedding(pue_alpha, detach=False).unsqueeze(0)
-        protos.append(wu)
-    proto = torch.cat(protos, dim=0)                              # [M, D]
-    m = proto.size(0)
-    if m <= 1:
-        return proto.new_zeros(())
-
-    gram = proto @ proto.t()
-    off_diag = ~torch.eye(m, dtype=torch.bool, device=proto.device)
-    target = -1.0 / float(m - 1)
-    return (gram.masked_select(off_diag) - target).pow(2).mean()
-
-def feature_anchor_loss(model: CLIPEDLClassifier, feats: torch.Tensor, labels: torch.Tensor,
-                        sample_weight: torch.Tensor | None = None) -> torch.Tensor:
-    """NC-style 特征紧致项：把样本特征轻量拉向其类别文本锚点。"""
-    wk = model.adapted_class_embeds()
-    target = wk[labels]
-    per_sample = 1.0 - (feats * target).sum(dim=1)
-    if sample_weight is not None:
-        per_sample = per_sample * sample_weight
-        return per_sample.sum() / sample_weight.sum().clamp_min(1e-8)
-    return per_sample.mean()
-
 # ===========================================================================
 # 6. 训练与统计
 # ===========================================================================
 def run_epoch(model, loader, device, optimizer=None, cfg=None, class_weight=None):
-    """一个 epoch。损失 = EDL（含 KL 正则）+ 可选几何稳定正则。"""
+    """一个 epoch。损失 = EDL（含 KL 正则，kl_w 由 cfg 给定）。"""
     assert cfg is not None
     train = optimizer is not None
     model.train(train)
     total, correct = 0, 0
-    loss_sum = edl_loss_sum = proto_geo_sum = feat_geo_sum = u_sum = 0.0
+    loss_sum = u_sum = 0.0
     torch.set_grad_enabled(train)
 
     for x, y in loader:
         x = x.to(device, non_blocking=True)
         y = y.to(device, non_blocking=True)
-        logits, feats = model.forward_feats(x)
+        logits, _ = model.forward_feats(x)
         alpha = edl_alpha(logits)
 
         sw = class_weight[y] if class_weight is not None else None
-        loss_edl = edl_loss(alpha, y, cfg["kl_w"], sample_weight=sw)
-        proto_geo = logits.new_zeros(())
-        feat_geo = logits.new_zeros(())
-        loss = loss_edl
-
-        if cfg.get("geom_w", 0.0) > 0:
-            proto_geo = prototype_etf_loss(
-                model,
-                include_pue=bool(cfg.get("geom_include_pue", True)),
-                pue_alpha=float(cfg.get("geom_pue_alpha", 1.0)),
-            )
-            loss = loss + float(cfg["geom_w"]) * proto_geo
-
-        if cfg.get("geom_feature_w", 0.0) > 0:
-            feat_geo = feature_anchor_loss(model, feats, y, sample_weight=sw)
-            loss = loss + float(cfg["geom_feature_w"]) * feat_geo
+        loss = edl_loss(alpha, y, cfg["kl_w"], sample_weight=sw)
 
         if train:
             optimizer.zero_grad()
@@ -627,21 +625,11 @@ def run_epoch(model, loader, device, optimizer=None, cfg=None, class_weight=None
             bs = x.size(0)
             total += bs
             loss_sum += loss.item() * bs
-            edl_loss_sum += loss_edl.item() * bs
-            proto_geo_sum += proto_geo.item() * bs
-            feat_geo_sum += feat_geo.item() * bs
             u_sum += edl_uncertainty(alpha).mean().item() * bs
 
     torch.set_grad_enabled(True)
     n = max(total, 1)
-    return {
-        "loss": loss_sum / n,
-        "edl_loss": edl_loss_sum / n,
-        "proto_geo": proto_geo_sum / n,
-        "feat_geo": feat_geo_sum / n,
-        "u": u_sum / n,
-        "acc": correct / n,
-    }
+    return {"loss": loss_sum / n, "u": u_sum / n, "acc": correct / n}
 
 @torch.no_grad()
 def _collect_scores(model, loader, device):
@@ -735,9 +723,6 @@ def train_main(args):
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     print(f"[loss] EDL(digamma) + KL 正则 (kl_weight={args.kl_weight}, 前{args.kl_anneal:.0%}个epoch线性渐入)")
-    print(f"[loss] 几何稳定正则: proto_etf_weight={args.geom_weight} "
-          f"(include_pue={args.geom_include_pue}, pue_alpha={args.pue_alpha}, anneal={args.geom_anneal:.0%}); "
-          f"feature_anchor_weight={args.geom_feature_weight}")
 
     def save_ckpt(epoch: int, path: Path):
         """统计训练集 EDL/MSP/Energy 分数分位（建议阈值）并保存当前权重到 path。"""
@@ -767,12 +752,6 @@ def train_main(args):
             "pue_alpha": args.pue_alpha,
             "adapter_ratio": args.adapter_ratio,              # 适配器结构（影响参数形状，必须存）
             "adapter_beta": args.adapter_beta,                # 残差权重（非参数，必须存）
-            "geometry": {
-                "proto_etf_weight": args.geom_weight,
-                "proto_etf_include_pue": args.geom_include_pue,
-                "proto_etf_anneal": args.geom_anneal,
-                "feature_anchor_weight": args.geom_feature_weight,
-            },
             "head": "clip_edl_adapter",
             "epoch": epoch,
             "osr": {"suggested_thresh": suggested, "score_percentiles": score_pct}}, str(path))
@@ -787,23 +766,13 @@ def train_main(args):
 
         # KL 正则线性渐入：先让证据/判别收敛，再逐步压制误导证据（弱正则）
         ramp = float(np.clip(epoch / max(1.0, args.kl_anneal * E), 0.0, 1.0))
-        geom_ramp = float(np.clip(epoch / max(1.0, args.geom_anneal * E), 0.0, 1.0))
-        cfg = {
-            "kl_w": args.kl_weight * ramp,
-            "geom_w": args.geom_weight * geom_ramp,
-            "geom_include_pue": args.geom_include_pue,
-            "geom_pue_alpha": args.pue_alpha,
-            "geom_feature_w": args.geom_feature_weight * geom_ramp,
-        }
+        cfg = {"kl_w": args.kl_weight * ramp}
 
         tr = run_epoch(model, train_loader, device, optimizer, cfg, class_weight)
         scheduler.step()
 
-        print(f"epoch {epoch:3d}/{E} | kl_w {cfg['kl_w']:.4f} | geom_w {cfg['geom_w']:.5f} "
-              f"| feat_w {cfg['geom_feature_w']:.5f} | logit_scale {model.logit_scale.exp().item():.2f}")
-        print(f"    train | loss {tr['loss']:.4f}  edl {tr['edl_loss']:.4f}  "
-              f"proto_geo {tr['proto_geo']:.4f}  feat_geo {tr['feat_geo']:.4f}  "
-              f"mean_u {tr['u']:.4f}  acc {tr['acc']:.3f}")
+        print(f"epoch {epoch:3d}/{E} | kl_w {cfg['kl_w']:.4f} | logit_scale {model.logit_scale.exp().item():.2f}")
+        print(f"    train | loss {tr['loss']:.4f}  mean_u {tr['u']:.4f}  acc {tr['acc']:.3f}")
 
         if epoch % 10 == 0:
             ckpt_path = out_path.with_name(f"{out_path.stem}_ep{epoch}{out_path.suffix}")
@@ -968,7 +937,7 @@ class OpenSetCLIPEDLClassifier:
             results[i] = dict(
                 known=known,
                 cls_idx=ci if known else -1,
-                cls_name=self.class_names[ci] if known else "unknown",
+                cls_name=self.class_names[ci] if known else "未知",
                 cls_prob=float(pred_prob[j]),
                 osr_score=float(scores[j]),
                 u=float(u[j]),
@@ -999,7 +968,7 @@ def draw_dets(img, dets):
     draw = ImageDraw.Draw(img)
     font = _get_font(16)
     for label, score, x1, y1, x2, y2, known in dets:
-        color = "green" if known else "red"
+        color = "red" if known else "orange"
         text = f"{label} {score:.2f}"
         draw.rectangle([x1, y1, x2, y2], outline=color, width=3)
         try:
@@ -1430,18 +1399,6 @@ def build_parser():
     t.add_argument("--kl-weight", type=float, default=0.1, help="EDL KL 正则最终权重（弱正则）")
     t.add_argument("--kl-anneal", type=float, default=0.5, help="KL 权重线性渐入所占总 epoch 比例")
 
-    # 几何稳定正则（吸收 ENC/Neural Collapse 思想，但不替换 EDL 监督）
-    t.add_argument("--geom-weight", type=float, default=0.00,
-                   help="适配后类原型的 ETF-style 几何正则权重；设 0 退回原始 EDL 损失")
-    t.add_argument("--geom-anneal", type=float, default=0.5,
-                   help="几何正则线性渐入所占总 epoch 比例")
-    t.add_argument("--geom-include-pue", dest="geom_include_pue", action="store_true", default=True,
-                   help="ETF 正则中纳入 PUE 伪未知方向，形成 K+1 开集原型，默认开")
-    t.add_argument("--no-geom-include-pue", dest="geom_include_pue", action="store_false",
-                   help="ETF 正则只约束已知类文本原型，不纳入 PUE 伪未知方向")
-    t.add_argument("--geom-feature-weight", type=float, default=0.00,
-                   help="可选 NC-style 特征到类别锚点收缩项权重，默认 0 表示关闭")
-
     # PUE（存进 ckpt 作为默认，测试时可覆盖）
     t.add_argument("--pue-alpha", type=float, default=1.0, help="伪未知嵌入 wU = w0' − α·w̄ 的 α（论文 Eq.2，本版 w0' 已过适配器）")
 
@@ -1508,41 +1465,57 @@ if __name__ == "__main__":
 '''
 conda activate myenv2
 
+# ★ 阶段1改用 lyuwenyu 官方 RT-DETR(rtdetr_pytorch)。需要额外提供：
+#   --rtdetr-config  官方 YAML config（把 num_classes 改成 1，单类 "object"）
+#   --rtdetr-root    官方 rtdetr_pytorch 根目录(含 src/)，或设环境变量 RTDETR_ROOT
+#   --yw-ckpt        官方 det_solver 保存的 .pth（含 model/ema，优先用 ema）
+# 例：export RTDETR_ROOT=/home/abc/HL/RT-DETR/rtdetr_pytorch
+
+# ---------- 训练（默认：冻结 CLIP backbone，只训 文本适配器+温度） ----------
+python train_two_stage3.py train \
+  --json /home/abc/HL/z-DVOPID/DVOXPID_M/train.json \
+  --img-root /home/abc/HL/z-DVOPID/DVOXPID_M/train \
+  --yw-ckpt /home/abc/HL/z-DVOPID/out/rtdetr_obj/best.pth \
+  --rtdetr-config /home/abc/HL/RT-DETR/rtdetr_pytorch/configs/rtdetr/rtdetr_r50vd_6x_coco.yml \
+  --rtdetr-root /home/abc/HL/RT-DETR/rtdetr_pytorch \
+  --out /home/abc/HL/z-DVOPID/out/box_classifier_clip_edl_rtdetr.pt \
+  --clip-model ViT-B-16 --clip-pretrained openai --prompt-style xray \
+  --epochs 25 --batch-size 64 --imgsz 224 --lr 1e-3 \
+  --adapter-ratio 4 --adapter-beta 0.5 --kl-weight 0.1 \
+  --prop-conf 0.05 --prop-iou 0.7 --prop-max-det 300 --pos-iou 0.5 --expand 0.1
+
 # ---------- 训练（解冻 CLIP backbone 微调：X光域差距大，推荐这条） ----------
 python twoStage.py train \
-  --json     /home/abc/HL/z-DVOPID/data/OXPID_M/train.json \
-  --img-root /home/abc/HL/z-DVOPID/data/OXPID_M/train \
-  --yw-ckpt  /home/abc/HL/rtdetr_pytorch/output/rtdetr_r50vd_6x_coco/checkpoint0028.pth \
-  --rtdetr-config /home/abc/HL/rtdetr_pytorch/configs/rtdetr/rtdetr_r50vd_6x_pidray.yml \
-  --rtdetr-root   /home/abc/HL/rtdetr_pytorch \
-  --out /home/abc/HL/rtdetr_pytorch/outputTwoStage/box_classifier_clip_edl_rtdetr.pt \
+  --json     /home/hl/Student/CQD/z-DVOPID/data/OXPID_M/train.json \
+  --img-root /home/hl/Student/CQD/z-DVOPID/data/OXPID_M/train \
+  --yw-ckpt  /home/hl/Student/CQD/rtdetr_pytorch/output/rtdetr_r50vd_6x_pidray/checkpoint0060.pth \
+  --rtdetr-config /home/hl/Student/CQD/rtdetr_pytorch/configs/rtdetr/rtdetr_r50vd_6x_pidray.yml \
+  --rtdetr-root   /home/hl/Student/CQD/rtdetr_pytorch \
+  --out /home/hl/Student/CQD/rtdetr_pytorch/outputTwoStage/box_classifier_clip_edl_rtdetr.pt \
   --clip-model ViT-B-16 --clip-pretrained openai --prompt-style xray \
   --unfreeze-backbone --backbone-lr 1e-5 --freeze-epochs 3 --lr 5e-4 \
-  --epochs 50 --batch-size 64 --adapter-ratio 4 --adapter-beta 0.5 --kl-weight 0.1 \
-  --geom-weight 0.01 --geom-anneal 0.5 --geom-feature-weight 0.0
+  --epochs 50 --batch-size 64 --adapter-ratio 4 --adapter-beta 0.5 --kl-weight 0.1
 
 # ---------- 单图预测 ----------
 python twoStage.py predict \
-  --yw-ckpt  /home/hl/Student/CQD/rtdetr_pytorch/output/rtdetr_r50vd_6x_pidray/checkpoint0060-oxpid.pth \
+  --yw-ckpt  /home/hl/Student/CQD/rtdetr_pytorch/output/rtdetr_r50vd_6x_pidray/checkpoint0060.pth \
   --rtdetr-config /home/hl/Student/CQD/rtdetr_pytorch/configs/rtdetr/rtdetr_r50vd_6x_pidray.yml \
   --rtdetr-root   /home/hl/Student/CQD/rtdetr_pytorch \
-  --clf-ckpt /home/hl/Student/CQD/rtdetr_pytorch/outputTwoStage/geom_feature_weight_sweep_geo2_seed0/geom_feature_w0p005_s0.pt \
-  --image /home/hl/Student/CQD/z-DVOPID/data/OXPID_M/val/01273.jpg \
-  --out   /home/hl/Student/CQD/rtdetr_pytorch/out/pred_01273.jpg \
+  --clf-ckpt /home/hl/Student/CQD/rtdetr_pytorch/outputTwoStage/box_classifier_clip_edl_rtdetr.pt \
+  --image /home/hl/Student/CQD/z-DVOPID/data/OXPID_M/val/00054.jpg \
+  --out   /home/hl/Student/CQD/rtdetr_pytorch/out/pred_00054.jpg \
   --conf 0.25 --iou 0.5 --osr-method edl_pue \
-  --save-txt --txt-out /home/hl/Student/CQD/rtdetr_pytorch/out/pred_01273.txt
-  
-  
+  --save-txt --txt-out /home/hl/Student/CQD/rtdetr_pytorch/out/pred_00054.txt
 
 # ---------- 批量评估（mAPK + APU + WI + AOSE + U-Recall） ----------
 # 注意：WI/AOSE 对 conf 敏感，固定用低 conf(0.05)；WI 默认在已知召回 0.8 处报告。
 python twoStage.py eval \
-  --yw-ckpt /home/abc/HL/rtdetr_pytorch/output/rtdetr_r50vd_6x_coco/checkpoint0028.pth \
-  --rtdetr-config /home/abc/HL/rtdetr_pytorch/configs/rtdetr/rtdetr_r50vd_6x_pidray.yml \
-  --rtdetr-root /home/abc/HL/rtdetr_pytorch \
-  --clf-ckpt /home/abc/HL/rtdetr_pytorch/outputTwoStage/box_classifier_clip_edl_rtdetr.pt \
-  --json /home/abc/HL/z-DVOPID/data/OXPID_M/test.json \
-  --img-root /home/abc/HL/z-DVOPID/data/OXPID_M/val \
+  --yw-ckpt /home/hl/Student/CQD/rtdetr_pytorch/output/rtdetr_r50vd_6x_pidray/checkpoint0060.pth \
+  --rtdetr-config /home/hl/Student/CQD/rtdetr_pytorch/configs/rtdetr/rtdetr_r50vd_6x_pidray.yml \
+  --rtdetr-root /home/hl/Student/CQD/rtdetr_pytorch \
+  --clf-ckpt /home/hl/Student/CQD/rtdetr_pytorch/outputTwoStage/box_classifier_clip_edl_rtdetr.pt \
+  --json /home/hl/Student/CQD/z-DVOPID/data/OXPID_M/test.json \
+  --img-root /home/hl/Student/CQD/z-DVOPID/data/OXPID_M/val \
   --conf 0.05 --iou 0.5 --osr-method edl_pue \
   --map-iou 0.5 --coco-map --osr-iou 0.5 --wi-recall 0.8
 '''
